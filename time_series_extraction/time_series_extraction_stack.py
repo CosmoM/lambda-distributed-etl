@@ -1,11 +1,9 @@
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: MIT-0
-
+import os
 from aws_cdk import (
     Stack,
     Duration,
     aws_lambda as _lambda,
-    aws_lambda_python_alpha as lambda_python,
+    aws_ecr_assets as ecr_assets,
     aws_s3 as s3,
     aws_s3_deployment as s3_deploy,
     aws_glue as glue,
@@ -15,36 +13,48 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-
 class TimeSeriesExtractionStack(Stack):
-    DATA_LOCATION = "MSG/MDSSFTD/NETCDF/"  # Location of input data in the s3 bucket
-    INTERMEDIATE_LOCATION = "output/intermediate/"  # Location of output data from the Lambda process, and input for the Glue job
-    OUTPUT_LOCATION = "output/final/"  # Location of output data from the Glue job"
+    DATA_LOCATION = "MSG/MDSSFTD/NETCDF/"
+    INTERMEDIATE_LOCATION = "output/intermediate/"
+    OUTPUT_LOCATION = "output/final/"
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        #########################################
-        #
-        # S3 bucket
-        #
-        # to store the data
-        #
-        #########################################
+        # Reference the existing S3 bucket for input data
+        bucket_data = s3.Bucket.from_bucket_name(
+            self,
+            "DataBucket",
+            "satellite-weather-data-010928188967-us-east-1"
+        )
 
-        # create s3 bucket
-        bucket_data = s3.Bucket(self, "DataBucket")
+        # Create a new bucket for storing Glue-related output
+        bucket_glue = s3.Bucket(self, "GlueBucket")
 
-        #########################################
-        #
-        # Lambda functions
-        #
-        # to generate the list of days
-        # and process each day
-        #
-        #########################################
+        # Build the Docker image for process-day Lambda
+        docker_asset_path = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        process_day_image = ecr_assets.DockerImageAsset(self, "ProcessDayImage",
+            directory=docker_asset_path
+        )
 
-        # create lambda function to generate the list of days
+        # Create Lambda function from the Docker image
+        process_day_lambda = _lambda.DockerImageFunction(
+            self,
+            "LambdaFunctionProcessDay",
+            code=_lambda.DockerImageCode.from_ecr(process_day_image.repository, tag=process_day_image.image_tag),
+            timeout=Duration.seconds(300),
+            memory_size=2048,
+            environment={
+                "BUCKET_NAME": bucket_data.bucket_name,  # Use the existing bucket
+                "INPUT_LOCATION": self.DATA_LOCATION,    # Data path: "MSG/MDSSFTD/NETCDF/"
+                "OUTPUT_LOCATION": self.INTERMEDIATE_LOCATION,
+            },
+        )
+
+        # Grant read/write permissions to the Lambda function on the S3 bucket
+        bucket_data.grant_read_write(process_day_lambda)
+
+        # Create generate-dates Lambda function (not using Docker)
         generate_dates_lambda = _lambda.Function(
             self,
             "LambdaFunctionGenerateDates",
@@ -53,37 +63,7 @@ class TimeSeriesExtractionStack(Stack):
             code=_lambda.Code.from_asset("./lambda/generate-dates"),
         )
 
-        # create Lambda function to process a day
-        process_day_lambda = lambda_python.PythonFunction(
-            self,
-            "LambdaFunctionProcessDay",
-            entry="./lambda/process-day",
-            runtime=_lambda.Runtime.PYTHON_3_10,
-            index="process-day.py",
-            handler="lambda_handler",
-            timeout=Duration.seconds(300),
-            memory_size=2048,
-            environment={
-                "BUCKET_NAME": bucket_data.bucket_name,
-                "INPUT_LOCATION": self.DATA_LOCATION,
-                "OUTPUT_LOCATION": self.INTERMEDIATE_LOCATION,
-            },
-        )
-
-        # give the Lambda function permissions to read and write in the bucket
-        bucket_data.grant_read_write(process_day_lambda)
-
-        #########################################
-        #
-        # Step Functions
-        #
-        # to orchestrate the Lambda functions
-        #
-        #########################################
-
-        # define the map state as a custom state,
-        # because DISTRIBUTED mode is not yet implemented in cdk
-
+        # Step Functions to orchestrate processing
         map_json = {
             "Type": "Map",
             "ItemProcessor": {
@@ -116,13 +96,13 @@ class TimeSeriesExtractionStack(Stack):
                 },
             },
             "End": True,
-            "MaxConcurrency": 365,
-            "Label": "Map",
+            "MaxConcurrency": 365,  # Concurrency for parallel execution of tasks
+            "ToleratedFailurePercentage": 99,  # Increase the tolerated failure percentage if you expect some tasks to fail
+            "ToleratedFailureCount": 357,  # Adjust the tolerated failure count if the number of expected failures is low
         }
 
         map_state = sfn.CustomState(self, "Map", state_json=map_json)
 
-        # create the date generation task
         dates_task = tasks.LambdaInvoke(
             self,
             "Generate List of Dates",
@@ -130,15 +110,13 @@ class TimeSeriesExtractionStack(Stack):
             payload_response_only=True,
         )
 
-        # create the Step Function to orchestrate the Lambda functions
         step_function = sfn.StateMachine(
             self,
             "SFOrchestrateLambda",
             definition=sfn.Chain.start(dates_task).next(map_state),
         )
 
-        # grant permission to step_function to start its own execution
-        # (required for a distributed map state)
+        # Grant necessary permissions to Step Functions
         step_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["states:StartExecution"],
@@ -149,7 +127,6 @@ class TimeSeriesExtractionStack(Stack):
             )
         )
 
-        # grant permission to step_function to invoke the ProcessDay Lambda function
         step_function.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["lambda:InvokeFunction"],
@@ -161,18 +138,7 @@ class TimeSeriesExtractionStack(Stack):
             )
         )
 
-        #########################################
-        #
-        # Glue Job
-        #
-        # to repartition the data by point_id
-        #
-        #########################################
-
-        # create a bucket to upload the code of the Glue job
-        bucket_glue = s3.Bucket(self, "GlueBucket")
-
-        # upload the code of the Glue job to the bucket_glue
+        # Deploy Glue job source code to S3
         s3_deploy.BucketDeployment(
             self,
             "UploadCodeGlue",
@@ -181,18 +147,16 @@ class TimeSeriesExtractionStack(Stack):
             destination_key_prefix="src",
         )
 
-        # create role for the Glue job
+        # Create IAM role for the Glue job
         glue_job_role = iam.Role(
             self, "GlueJobRole", assumed_by=iam.ServicePrincipal("glue.amazonaws.com")
         )
 
-        # grand read permissions to glue_job_role on src bucket
+        # Grant Glue job permissions to read from the input bucket and read/write to the Glue bucket
         bucket_glue.grant_read(glue_job_role)
-
-        # grant read and write permissions to glue_job_role on data bucket
         bucket_data.grant_read_write(glue_job_role)
 
-        # create Glue job to process the data
+        # Define the Glue job
         glue_job = glue.CfnJob(
             self,
             "GlueJob",
@@ -200,9 +164,7 @@ class TimeSeriesExtractionStack(Stack):
             command=glue.CfnJob.JobCommandProperty(
                 name="glueetl",
                 python_version="3",
-                script_location="s3://{}/src/glue_job.py".format(
-                    bucket_glue.bucket_name
-                ),
+                script_location=f"s3://{bucket_glue.bucket_name}/src/glue_job.py",
             ),
             description="Glue job to repartition the data",
             execution_property=glue.CfnJob.ExecutionPropertyProperty(
