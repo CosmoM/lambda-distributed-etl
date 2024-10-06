@@ -21,11 +21,18 @@ class TimeSeriesExtractionStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # Retrieve the AWS account number and region programmatically
+        account_id = Stack.of(self).account
+        region = Stack.of(self).region
+
+        # Construct the bucket name dynamically
+        data_bucket_name = f"satellite-weather-data-{account_id}-{region}"
+
         # Reference the existing S3 bucket for input data
         bucket_data = s3.Bucket.from_bucket_name(
             self,
             "DataBucket",
-            "satellite-weather-data-010928188967-us-east-1"
+            data_bucket_name
         )
 
         # Create a new bucket for storing Glue-related output
@@ -41,7 +48,10 @@ class TimeSeriesExtractionStack(Stack):
         process_day_lambda = _lambda.DockerImageFunction(
             self,
             "LambdaFunctionProcessDay",
-            code=_lambda.DockerImageCode.from_ecr(process_day_image.repository, tag=process_day_image.image_tag),
+            code=_lambda.DockerImageCode.from_ecr(
+                process_day_image.repository,
+                tag=process_day_image.image_tag
+            ),
             timeout=Duration.seconds(300),
             memory_size=2048,
             environment={
@@ -97,8 +107,8 @@ class TimeSeriesExtractionStack(Stack):
             },
             "End": True,
             "MaxConcurrency": 365,  # Concurrency for parallel execution of tasks
-            "ToleratedFailurePercentage": 99,  # Increase the tolerated failure percentage if you expect some tasks to fail
-            "ToleratedFailureCount": 357,  # Adjust the tolerated failure count if the number of expected failures is low
+            "ToleratedFailurePercentage": 99,  # Increase if you expect some tasks to fail
+            "ToleratedFailureCount": 357,      # Adjust based on expected failures
         }
 
         map_state = sfn.CustomState(self, "Map", state_json=map_json)
@@ -121,7 +131,7 @@ class TimeSeriesExtractionStack(Stack):
             iam.PolicyStatement(
                 actions=["states:StartExecution"],
                 resources=[
-                    f"arn:aws:states:{Stack.of(self).region}:{Stack.of(self).account}:stateMachine:SFOrchestrateLambda*"
+                    f"arn:aws:states:{region}:{account_id}:stateMachine:SFOrchestrateLambda*"
                 ],
                 effect=iam.Effect.ALLOW,
             )
